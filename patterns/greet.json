@@ -1,0 +1,12 @@
+{
+  "name": "greet",
+  "loop": false,
+  "steps": [
+    {"face": "happy", "duration": 50},
+    {"tilt":  20, "duration": 300},
+    {"tilt": -5,  "duration": 200},
+    {"tilt":  20, "duration": 300},
+    {"tilt":   0, "duration": 400},
+    {"face": "neutral", "duration": 50}
+  ]
+}

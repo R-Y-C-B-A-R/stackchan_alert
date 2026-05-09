@@ -1,0 +1,11 @@
+{
+  "name": "nervous",
+  "loop": true,
+  "steps": [
+    {"pan":  15, "tilt": -5, "duration": 150},
+    {"pan": -15, "tilt":  5, "duration": 150},
+    {"pan":  10, "tilt":  0, "duration": 120},
+    {"pan": -10, "tilt": -5, "duration": 120},
+    {"pan":   0, "tilt":  0, "duration": 200}
+  ]
+}

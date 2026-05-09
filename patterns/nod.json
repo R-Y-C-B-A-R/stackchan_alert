@@ -1,0 +1,9 @@
+{
+  "name": "nod",
+  "loop": false,
+  "steps": [
+    {"tilt":  20, "duration": 300},
+    {"tilt": -20, "duration": 300},
+    {"tilt":    0, "duration": 300}
+  ]
+}

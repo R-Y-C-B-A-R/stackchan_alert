@@ -2,21 +2,34 @@
 #include <Avatar.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <ESP32Servo.h>
 
 using namespace m5avatar;
 
 Avatar avatar;
 
-static const int STATUS_Y  = 200;
-static const int STATUS_H  = 40;
-static const int DISPLAY_W = 320;
-
-// Approximate number of chars visible in the avatar speech bubble
+static const int STATUS_Y    = 200;
+static const int STATUS_H    = 40;
+static const int DISPLAY_W   = 320;
 static const int SPEECH_CHARS = 18;
 
-// --- Alarm state ---------------------------------------------------------
+// ─── Servo pin configuration ───────────────────────────────────────────────
+// Adjust PIN_YAW / PIN_PITCH to match your StackChan wiring.
+// CoreS3 Port B = GPIO8 / GPIO9.  Set to -1 to disable an axis.
+static const int PIN_YAW     =  8;   // pan  (left / right)
+static const int PIN_PITCH   =  9;   // tilt (up / down)
+static const int CTR_YAW     = 90;   // servo center in degrees
+static const int CTR_PITCH   = 90;
+static const int RANGE_YAW   = 40;   // max ±° from center
+static const int RANGE_PITCH = 20;
+
+static Servo servoYaw;
+static Servo servoPitch;
+
+// ─── Alarm state ──────────────────────────────────────────────────────────
 static struct {
     bool          active     = false;
+    bool          nervous    = true;
     unsigned long startMs    = 0;
     unsigned long durMs      = 0;
     String        text;
@@ -26,9 +39,37 @@ static struct {
     bool          redBg      = false;
     unsigned long lastBlink  = 0;
     unsigned long lastScroll = 0;
+    unsigned long lastMove   = 0;
 } alm;
 
-// -------------------------------------------------------------------------
+// ─── Servo helpers ────────────────────────────────────────────────────────
+
+static int clamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void moveServos(int pan, int tilt) {
+    int yaw   = clamp(CTR_YAW   + pan,  CTR_YAW   - RANGE_YAW,   CTR_YAW   + RANGE_YAW);
+    int pitch = clamp(CTR_PITCH + tilt, CTR_PITCH - RANGE_PITCH,  CTR_PITCH + RANGE_PITCH);
+    if (PIN_YAW   >= 0) servoYaw.write(yaw);
+    if (PIN_PITCH >= 0) servoPitch.write(pitch);
+}
+
+static void centerServos() { moveServos(0, 0); }
+
+static void initServos() {
+    if (PIN_YAW >= 0) {
+        servoYaw.setPeriodHertz(50);
+        servoYaw.attach(PIN_YAW, 500, 2400);
+    }
+    if (PIN_PITCH >= 0) {
+        servoPitch.setPeriodHertz(50);
+        servoPitch.attach(PIN_PITCH, 500, 2400);
+    }
+    centerServos();
+}
+
+// ─── Display helpers ──────────────────────────────────────────────────────
 
 void clearStatus() {
     M5.Display.fillRect(0, STATUS_Y, DISPLAY_W, STATUS_H, TFT_BLACK);
@@ -41,6 +82,8 @@ void printStatus(const char* text) {
     M5.Display.setCursor(4, STATUS_Y + 8);
     M5.Display.print(text);
 }
+
+// ─── Audio helper ─────────────────────────────────────────────────────────
 
 void playFile(const char* name) {
     String path = String("/") + name + ".wav";
@@ -63,6 +106,8 @@ void playFile(const char* name) {
     free(buf);
 }
 
+// ─── Face helper ──────────────────────────────────────────────────────────
+
 void setFace(const char* expr) {
     if      (strcmp(expr, "happy")  == 0) avatar.setExpression(Expression::Happy);
     else if (strcmp(expr, "sad")    == 0) avatar.setExpression(Expression::Sad);
@@ -72,10 +117,9 @@ void setFace(const char* expr) {
     else                                   avatar.setExpression(Expression::Neutral);
 }
 
-// --- Alarm implementation ------------------------------------------------
-// All visual changes go through the Avatar API so they happen inside the
-// avatar's own render task — drawing directly to the display while the
-// avatar task is running causes corruption.
+// ─── Alarm implementation ─────────────────────────────────────────────────
+// All visual changes go through the Avatar API — direct display drawing
+// conflicts with the avatar's own FreeRTOS render task.
 
 static void setAvatarBg(bool red) {
     ColorPalette cp;
@@ -91,7 +135,6 @@ static void updateSpeechText() {
         avatar.setSpeechText(alm.text.c_str());
         return;
     }
-    // Circular character window — advance one char per call
     char buf[SPEECH_CHARS + 1];
     for (int i = 0; i < SPEECH_CHARS; i++) {
         buf[i] = alm.text[(alm.scrollIdx + i) % len];
@@ -101,6 +144,14 @@ static void updateSpeechText() {
     alm.scrollIdx = (alm.scrollIdx + 1) % len;
 }
 
+static void updateAlarmMovement() {
+    if (!alm.nervous) return;
+    unsigned long now = millis();
+    if (now - alm.lastMove < 200) return;
+    moveServos(random(-15, 16), random(-8, 9));
+    alm.lastMove = now;
+}
+
 void stopAlarm() {
     if (!alm.active) return;
     alm.active = false;
@@ -108,11 +159,13 @@ void stopAlarm() {
     if (alm.audioBuf) { free(alm.audioBuf); alm.audioBuf = nullptr; }
     avatar.setSpeechText("");
     setAvatarBg(false);
+    centerServos();
 }
 
-void startAlarm(const char* text, int durationSec) {
+void startAlarm(const char* text, int durationSec, bool nervous) {
     stopAlarm();
     alm.active    = true;
+    alm.nervous   = nervous;
     alm.startMs   = millis();
     alm.durMs     = (unsigned long)durationSec * 1000UL;
     alm.text      = text;
@@ -120,8 +173,8 @@ void startAlarm(const char* text, int durationSec) {
     unsigned long now = millis();
     alm.lastBlink  = now;
     alm.lastScroll = now;
+    alm.lastMove   = now;
 
-    // Load audio into PSRAM (3 MB+ file needs external RAM)
     File f = LittleFS.open("/facilityalarm.wav", "r");
     if (f) {
         alm.audioSz  = f.size();
@@ -145,33 +198,27 @@ void updateAlarm() {
         stopAlarm();
         return;
     }
-
-    // Re-loop audio when playback finishes
     if (alm.audioBuf && !M5.Speaker.isPlaying()) {
         M5.Speaker.playWav(alm.audioBuf, alm.audioSz);
     }
-
-    // Toggle background every 400 ms
     if (now - alm.lastBlink >= 400) {
         setAvatarBg(!alm.redBg);
         alm.lastBlink = now;
     }
-
-    // Advance text scroll every 300 ms
     if (now - alm.lastScroll >= 300) {
         updateSpeechText();
         alm.lastScroll = now;
     }
+    updateAlarmMovement();
 }
 
-// -------------------------------------------------------------------------
+// ─── Command handler ──────────────────────────────────────────────────────
 
 void handleCommand(JsonDocument& doc) {
     const char* cmd = doc["cmd"] | "";
 
     if (strcmp(cmd, "print") == 0) {
-        const char* text = doc["text"] | "";
-        printStatus(text);
+        printStatus(doc["text"] | "");
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "clear") == 0) {
@@ -180,32 +227,37 @@ void handleCommand(JsonDocument& doc) {
 
     } else if (strcmp(cmd, "play") == 0) {
         const char* file = doc["file"] | "";
-        if (file[0] == '\0') {
-            Serial.println("{\"ok\":false,\"err\":\"missing file\"}");
-            return;
-        }
+        if (file[0] == '\0') { Serial.println("{\"ok\":false,\"err\":\"missing file\"}"); return; }
         playFile(file);
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "face") == 0) {
-        const char* expr = doc["expr"] | "neutral";
-        setFace(expr);
+        setFace(doc["expr"] | "neutral");
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "alarm") == 0) {
-        const char* text = doc["text"] | "ALARM";
-        int dur = doc["duration"] | 5;
-        startAlarm(text, dur);
+        bool nervous = doc["nervous"] | true;
+        startAlarm(doc["text"] | "ALARM", doc["duration"] | 5, nervous);
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "stopalarm") == 0) {
         stopAlarm();
         Serial.println("{\"ok\":true}");
 
+    } else if (strcmp(cmd, "move") == 0) {
+        moveServos(doc["pan"] | 0, doc["tilt"] | 0);
+        Serial.println("{\"ok\":true}");
+
+    } else if (strcmp(cmd, "center") == 0) {
+        centerServos();
+        Serial.println("{\"ok\":true}");
+
     } else {
         Serial.printf("{\"ok\":false,\"err\":\"unknown cmd: %s\"}\n", cmd);
     }
 }
+
+// ─── Arduino entry points ─────────────────────────────────────────────────
 
 void setup() {
     auto cfg = M5.config();
@@ -215,12 +267,12 @@ void setup() {
     M5.Display.fillScreen(TFT_BLACK);
     M5.Speaker.setVolume(200);
 
-    // Partition is named "littlefs" in partitions.csv — must be passed explicitly
     if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
         M5.Display.setTextColor(TFT_RED);
         M5.Display.println("LittleFS error");
     }
 
+    initServos();
     avatar.init();
     M5.Display.drawFastHLine(0, STATUS_Y, DISPLAY_W, TFT_DARKGREY);
 

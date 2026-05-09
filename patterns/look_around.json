@@ -1,0 +1,11 @@
+{
+  "name": "look_around",
+  "loop": false,
+  "steps": [
+    {"pan":  35, "tilt":  0, "duration": 600},
+    {"pan": -35, "tilt":  0, "duration": 600},
+    {"pan":   0, "tilt": 18, "duration": 500},
+    {"pan":   0, "tilt": -8, "duration": 500},
+    {"pan":   0, "tilt":  0, "duration": 400}
+  ]
+}
