@@ -178,6 +178,9 @@ movement pattern JSON format  (see patterns/ directory):
             print(json.dumps({"ok": True, "info": "interrupted, centered"}))
         return
 
+    # scan needs extra time (probes 10 pins sequentially)
+    send_timeout = 15.0 if args.cmd == "scan" else 5.0
+
     payload = {"cmd": args.cmd}
 
     if args.cmd == "face":
@@ -195,7 +198,7 @@ movement pattern JSON format  (see patterns/ directory):
         payload["pan"]  = args.pan
         payload["tilt"] = args.tilt
 
-    result = send(payload)
+    result = send(payload, timeout=send_timeout)
     print(json.dumps(result))
 
     # After alarm start, drive head via motion pattern file if requested

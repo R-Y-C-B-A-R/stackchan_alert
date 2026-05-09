@@ -253,8 +253,9 @@ void handleCommand(JsonDocument& doc) {
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "scan") == 0) {
-        // Probe candidate GPIO pins one by one with a brief 45° movement.
+        // Probe candidate GPIO pins one by one with a brief sweep.
         // Watch which pin makes your servo twitch to identify correct wiring.
+        // Each pin: 120ms move + 120ms return + 40ms gap = 280ms → 10 pins < 3s total.
         static const int candidates[] = {1, 2, 7, 8, 9, 10, 17, 18, 38, 39};
         static const int n = sizeof(candidates) / sizeof(candidates[0]);
         JsonDocument resp;
@@ -266,11 +267,11 @@ void handleCommand(JsonDocument& doc) {
             Servo probe;
             probe.setPeriodHertz(50);
             if (probe.attach(pin, 500, 2400) >= 0) {
-                probe.write(50);  delay(400);
-                probe.write(90);  delay(200);
+                probe.write(120); delay(120);
+                probe.write(90);  delay(120);
                 probe.detach();
             }
-            delay(100);
+            delay(40);
         }
         serializeJson(resp, Serial);
         Serial.println();
