@@ -255,6 +255,9 @@ movement pattern JSON format  (see patterns/ directory):
     # ── scan ──────────────────────────────────────────────────────────────
     sub.add_parser("scan", help="Servo wiggle test (verifies SCS communication)")
 
+    # ── ping ──────────────────────────────────────────────────────────────
+    sub.add_parser("ping", help="Read servo positions (diagnostic: -2=no RX, -1=no response)")
+
     # ─────────────────────────────────────────────────────────────────────
     args = p.parse_args()
 
@@ -284,7 +287,12 @@ movement pattern JSON format  (see patterns/ directory):
         return
 
     # scan needs extra time (wiggle test takes ~1.5 s on device)
-    send_timeout = 5.0 if args.cmd != "scan" else 10.0
+    # ping needs extra time for two serial reads (2 × 15 ms + margin)
+    send_timeout = 5.0
+    if args.cmd == "scan":
+        send_timeout = 10.0
+    elif args.cmd == "ping":
+        send_timeout = 3.0
 
     payload = {"cmd": args.cmd}
     if args.cmd == "face":
