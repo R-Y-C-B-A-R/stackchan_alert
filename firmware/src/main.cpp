@@ -252,6 +252,29 @@ void handleCommand(JsonDocument& doc) {
         centerServos();
         Serial.println("{\"ok\":true}");
 
+    } else if (strcmp(cmd, "scan") == 0) {
+        // Probe candidate GPIO pins one by one with a brief 45° movement.
+        // Watch which pin makes your servo twitch to identify correct wiring.
+        static const int candidates[] = {1, 2, 7, 8, 9, 10, 17, 18, 38, 39};
+        static const int n = sizeof(candidates) / sizeof(candidates[0]);
+        JsonDocument resp;
+        resp["ok"] = true;
+        JsonArray tried = resp["pins"].to<JsonArray>();
+        for (int i = 0; i < n; i++) {
+            int pin = candidates[i];
+            tried.add(pin);
+            Servo probe;
+            probe.setPeriodHertz(50);
+            if (probe.attach(pin, 500, 2400) >= 0) {
+                probe.write(50);  delay(400);
+                probe.write(90);  delay(200);
+                probe.detach();
+            }
+            delay(100);
+        }
+        serializeJson(resp, Serial);
+        Serial.println();
+
     } else {
         Serial.printf("{\"ok\":false,\"err\":\"unknown cmd: %s\"}\n", cmd);
     }

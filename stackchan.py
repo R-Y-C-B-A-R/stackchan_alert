@@ -159,12 +159,21 @@ movement pattern JSON format  (see patterns/ directory):
                     help="Loop until Ctrl-C "
                          "(overrides the loop flag inside the pattern file)")
 
+    # ── scan ──────────────────────────────────────────────────────────────
+    sub.add_parser(
+        "scan",
+        help="Probe GPIO pins to find servo wiring "
+             "(watch which pin makes your servo twitch)",
+    )
+
     # ─────────────────────────────────────────────────────────────────────
     args = p.parse_args()
 
     if args.cmd == "run":
         ok = run_pattern(args.file, loop_override=args.loop)
-        if not ok:
+        if ok:
+            print(json.dumps({"ok": True}))
+        else:
             send({"cmd": "center"})
             print(json.dumps({"ok": True, "info": "interrupted, centered"}))
         return
