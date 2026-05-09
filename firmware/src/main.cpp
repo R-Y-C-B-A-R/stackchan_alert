@@ -25,8 +25,8 @@ static const uint8_t ID_YAW       = 1;
 static const uint8_t ID_PITCH     = 2;
 static const int     CTR_YAW      = 460;   // neutral position in SCS units
 static const int     CTR_PITCH    = 620;
-static const int     RANGE_YAW    = 200;   // ±200 units ≈ ±62°
-static const int     RANGE_PITCH  = 100;   // ±100 units ≈ ±31°
+static const int     RANGE_YAW    = 400;   // center 460 → 60..860 (within 0-1000)
+static const int     RANGE_PITCH  = 380;   // center 620 → 240..1000 (full upward range)
 
 // SCS register addresses (big-endian byte order for SCSCL series)
 static const uint8_t REG_TORQUE   = 0x28;  // Torque Enable
@@ -68,7 +68,7 @@ static void scsTorque(uint8_t id, bool on) {
 }
 
 // degrees from center → SCS units  (1° = 3.2 units = 16/5)
-static int degToUnits(int deg) { return deg * 16 / 5; }
+static int degToUnits(int deg) { return deg * 38 / 9; }
 
 static void moveServos(int pan, int tilt) {
     int yaw   = constrain(CTR_YAW   + degToUnits(pan),
