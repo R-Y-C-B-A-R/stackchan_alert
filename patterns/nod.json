@@ -2,8 +2,9 @@
   "name": "nod",
   "loop": false,
   "steps": [
-    {"tilt":  20, "duration": 300},
-    {"tilt": -20, "duration": 300},
-    {"tilt":    0, "duration": 300}
+    {"tilt":  35, "duration": 350},
+    {"tilt":   0, "duration": 250},
+    {"tilt":  35, "duration": 350},
+    {"tilt":   0, "duration": 300}
   ]
 }
