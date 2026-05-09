@@ -4,29 +4,113 @@ import serial
 import json
 import sys
 import time
+import glob
+import grp
+import os
 import argparse
 
-PORT = "/dev/ttyACM0"
 BAUD = 115200
 
 
-def send(cmd: dict, timeout: float = 5.0) -> dict:
-    with serial.Serial(PORT, BAUD, timeout=1.0) as s:
-        s.write(json.dumps(cmd).encode() + b"\n")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            line = s.readline().decode(errors="replace").strip()
-            if not line:
-                continue
-            if line.startswith("{"):
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    return {"ok": False, "err": f"bad json: {line}"}
-        return {"ok": False, "err": "timeout"}
+# ─── Port detection (Linux) ───────────────────────────────────────────────
+
+def check_dialout():
+    """Warn if the current session doesn't have dialout access."""
+    if not sys.platform.startswith("linux"):
+        return
+    user = os.getenv("USER") or os.getenv("LOGNAME") or "$(whoami)"
+    try:
+        gid = grp.getgrnam("dialout").gr_gid
+    except KeyError:
+        return  # no dialout group on this system
+
+    if gid in os.getgroups():
+        return  # already active in this session
+
+    try:
+        members = grp.getgrnam("dialout").gr_mem
+    except KeyError:
+        members = []
+
+    if user in members:
+        print("[INFO] dialout group is not active in this session.")
+        print("       Quick fix (current shell only):  newgrp dialout")
+        print("       Permanent fix:                   log out and back in")
+    else:
+        print(f"[INFO] User '{user}' is not in the dialout group.")
+        print(f"       Run: sudo usermod -aG dialout {user}")
+        print("       Then log out and back in (or: newgrp dialout)")
 
 
-def run_pattern(path, loop_override=False, deadline=None):
+def find_ports():
+    """Return candidate serial ports on Linux, ESP32-S3 (VID 303a) first."""
+    if not sys.platform.startswith("linux"):
+        return []
+    preferred, others = [], []
+    for pattern in ["/dev/ttyACM*", "/dev/ttyUSB*"]:
+        for port in sorted(glob.glob(pattern)):
+            name = os.path.basename(port)
+            is_esp32s3 = False
+            try:
+                with open(f"/sys/class/tty/{name}/device/uevent") as f:
+                    if "303a" in f.read().lower():  # Espressif VID
+                        is_esp32s3 = True
+            except OSError:
+                pass
+            (preferred if is_esp32s3 else others).append(port)
+    return preferred + others
+
+
+def resolve_port(port_arg):
+    """Return the port to use; auto-detect if not specified."""
+    if port_arg:
+        return port_arg
+
+    check_dialout()
+    candidates = find_ports()
+
+    if not candidates:
+        print("[ERROR] No serial ports found. Is the StackChan connected via USB?",
+              file=sys.stderr)
+        if sys.platform.startswith("linux"):
+            print("        Check: ls /dev/ttyACM*", file=sys.stderr)
+        sys.exit(1)
+
+    port = candidates[0]
+    if len(candidates) == 1:
+        print(f"[INFO] Auto-detected port: {port}")
+    else:
+        print(f"[INFO] Multiple ports found: {', '.join(candidates)}")
+        print(f"[INFO] Using {port}  (use --port to override)")
+    return port
+
+
+# ─── Serial communication ─────────────────────────────────────────────────
+
+def send(cmd: dict, port: str, timeout: float = 5.0) -> dict:
+    try:
+        with serial.Serial(port, BAUD, timeout=1.0) as s:
+            s.write(json.dumps(cmd).encode() + b"\n")
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                line = s.readline().decode(errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        return {"ok": False, "err": f"bad json: {line}"}
+            return {"ok": False, "err": "timeout"}
+    except serial.SerialException as e:
+        if "Permission denied" in str(e):
+            check_dialout()
+        return {"ok": False, "err": str(e)}
+
+
+# ─── Pattern execution ────────────────────────────────────────────────────
+
+def run_pattern(path, port, loop_override=False, deadline=None):
     """Execute a movement pattern JSON file.
     deadline: time.time() value — stop when reached (for alarm --motion).
     Returns False if interrupted by Ctrl-C.
@@ -49,14 +133,14 @@ def run_pattern(path, loop_override=False, deadline=None):
                 if "pan" in step or "tilt" in step:
                     r = send({"cmd": "move",
                               "pan":  step.get("pan",  0),
-                              "tilt": step.get("tilt", 0)})
+                              "tilt": step.get("tilt", 0)}, port=port)
                     if not r.get("ok"):
                         print(json.dumps(r))
                         sys.exit(1)
                 if "face" in step:
-                    send({"cmd": "face", "expr": step["face"]})
+                    send({"cmd": "face", "expr": step["face"]}, port=port)
                 if "text" in step:
-                    send({"cmd": "print", "text": step["text"]})
+                    send({"cmd": "print", "text": step["text"]}, port=port)
                 wait = step.get("duration", 200) / 1000.0
                 if deadline:
                     wait = min(wait, max(0.0, deadline - time.time()))
@@ -67,6 +151,8 @@ def run_pattern(path, loop_override=False, deadline=None):
     except KeyboardInterrupt:
         return False
 
+
+# ─── CLI ──────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(
@@ -83,6 +169,8 @@ examples:
   %(prog)s center
   %(prog)s run patterns/look_around.json
   %(prog)s run patterns/nervous.json --loop
+  %(prog)s --port /dev/ttyACM1 face happy
+  %(prog)s ports
 
 movement pattern JSON format  (see patterns/ directory):
   {
@@ -100,7 +188,14 @@ movement pattern JSON format  (see patterns/ directory):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    p.add_argument("--port", metavar="DEV",
+                   help="Serial port (e.g. /dev/ttyACM0, COM3). "
+                        "Auto-detected if omitted.")
+
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    # ── ports ─────────────────────────────────────────────────────────────
+    sub.add_parser("ports", help="List detected serial ports (Linux)")
 
     # ── face ──────────────────────────────────────────────────────────────
     fa = sub.add_parser("face", help="Set avatar expression")
@@ -143,11 +238,9 @@ movement pattern JSON format  (see patterns/ directory):
     # ── move ──────────────────────────────────────────────────────────────
     mv = sub.add_parser("move", help="Move head servos to a position")
     mv.add_argument("--pan",  type=int, default=0, metavar="DEG",
-                    help="Horizontal offset from center in degrees "
-                         "(positive=right, negative=left,  default: 0)")
+                    help="Horizontal degrees from center (positive=right, default: 0)")
     mv.add_argument("--tilt", type=int, default=0, metavar="DEG",
-                    help="Vertical offset from center in degrees "
-                         "(positive=up, negative=down,  default: 0)")
+                    help="Vertical degrees from center (positive=up, default: 0)")
 
     # ── center ────────────────────────────────────────────────────────────
     sub.add_parser("center", help="Return head servos to center position")
@@ -160,29 +253,40 @@ movement pattern JSON format  (see patterns/ directory):
                          "(overrides the loop flag inside the pattern file)")
 
     # ── scan ──────────────────────────────────────────────────────────────
-    sub.add_parser(
-        "scan",
-        help="Probe GPIO pins to find servo wiring "
-             "(watch which pin makes your servo twitch)",
-    )
+    sub.add_parser("scan", help="Servo wiggle test (verifies SCS communication)")
 
     # ─────────────────────────────────────────────────────────────────────
     args = p.parse_args()
 
+    # ── ports: no device connection needed ────────────────────────────────
+    if args.cmd == "ports":
+        check_dialout()
+        candidates = find_ports()
+        if candidates:
+            print("Detected ports:")
+            for c in candidates:
+                tag = "  [ESP32-S3]" if _is_esp32s3(c) else ""
+                print(f"  {c}{tag}")
+        else:
+            print("No serial ports found.")
+        return
+
+    port = resolve_port(args.port)
+
+    # ── run ───────────────────────────────────────────────────────────────
     if args.cmd == "run":
-        ok = run_pattern(args.file, loop_override=args.loop)
+        ok = run_pattern(args.file, port=port, loop_override=args.loop)
         if ok:
             print(json.dumps({"ok": True}))
         else:
-            send({"cmd": "center"})
+            send({"cmd": "center"}, port=port)
             print(json.dumps({"ok": True, "info": "interrupted, centered"}))
         return
 
-    # scan needs extra time (probes 10 pins sequentially)
-    send_timeout = 15.0 if args.cmd == "scan" else 5.0
+    # scan needs extra time (wiggle test takes ~1.5 s on device)
+    send_timeout = 5.0 if args.cmd != "scan" else 10.0
 
     payload = {"cmd": args.cmd}
-
     if args.cmd == "face":
         payload["expr"] = args.expr
     elif args.cmd == "print":
@@ -193,23 +297,32 @@ movement pattern JSON format  (see patterns/ directory):
         payload["text"]     = args.text
         payload["duration"] = args.duration
         if args.motion:
-            payload["nervous"] = False  # Python controls movement via --motion
+            payload["nervous"] = False
     elif args.cmd == "move":
         payload["pan"]  = args.pan
         payload["tilt"] = args.tilt
 
-    result = send(payload, timeout=send_timeout)
+    result = send(payload, port=port, timeout=send_timeout)
     print(json.dumps(result))
 
-    # After alarm start, drive head via motion pattern file if requested
+    # After alarm start, optionally drive head via motion pattern
     if args.cmd == "alarm" and getattr(args, "motion", None) and result.get("ok"):
         deadline = time.time() + args.duration
-        ok = run_pattern(args.motion, loop_override=True, deadline=deadline)
+        ok = run_pattern(args.motion, port=port, loop_override=True, deadline=deadline)
         if not ok:
-            send({"cmd": "stopalarm"})
-        send({"cmd": "center"})
+            send({"cmd": "stopalarm"}, port=port)
+        send({"cmd": "center"}, port=port)
 
     sys.exit(0 if result.get("ok") else 1)
+
+
+def _is_esp32s3(port):
+    name = os.path.basename(port)
+    try:
+        with open(f"/sys/class/tty/{name}/device/uevent") as f:
+            return "303a" in f.read().lower()
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":
