@@ -2,7 +2,7 @@
 #include <Avatar.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include <ESP32Servo.h>
+#include <HardwareSerial.h>
 
 using namespace m5avatar;
 
@@ -13,18 +13,88 @@ static const int STATUS_H    = 40;
 static const int DISPLAY_W   = 320;
 static const int SPEECH_CHARS = 18;
 
-// ─── Servo pin configuration ───────────────────────────────────────────────
-// Adjust PIN_YAW / PIN_PITCH to match your StackChan wiring.
-// CoreS3 Port B = GPIO8 / GPIO9.  Set to -1 to disable an axis.
-static const int PIN_YAW     =  8;   // pan  (left / right)
-static const int PIN_PITCH   =  9;   // tilt (up / down)
-static const int CTR_YAW     = 90;   // servo center in degrees
-static const int CTR_PITCH   = 90;
-static const int RANGE_YAW   = 40;   // max ±° from center
-static const int RANGE_PITCH = 20;
+// ─── Feetech SCSCL serial servo ──────────────────────────────────────────
+// Half-duplex UART1 at 1 Mbps on GPIO6 (TX) / GPIO7 (RX)
+// Servo IDs and center positions from official M5Stack StackChan firmware.
+static HardwareSerial scsBus(1);
+static const int     SCS_TX    = 6;
+static const int     SCS_RX    = 7;
+static const int     SCS_BAUD  = 1000000;
 
-static Servo servoYaw;
-static Servo servoPitch;
+static const uint8_t ID_YAW       = 1;
+static const uint8_t ID_PITCH     = 2;
+static const int     CTR_YAW      = 460;   // neutral position in SCS units
+static const int     CTR_PITCH    = 620;
+static const int     RANGE_YAW    = 200;   // ±200 units ≈ ±62°
+static const int     RANGE_PITCH  = 100;   // ±100 units ≈ ±31°
+
+// SCS register addresses (big-endian byte order for SCSCL series)
+static const uint8_t REG_TORQUE   = 0x28;  // Torque Enable
+static const uint8_t REG_GOAL_POS = 0x2A;  // Goal Position L (H is at 0x2B)
+
+// Send an SCS protocol packet:
+//   FF FF [id] [nparams+2] [ins] [params...] [chksum]
+static void scsSend(uint8_t id, uint8_t ins, const uint8_t* p, int n) {
+    uint8_t len = (uint8_t)(n + 2);
+    uint8_t chk = id + len + ins;
+    for (int i = 0; i < n; i++) chk += p[i];
+    chk = ~chk & 0xFF;
+
+    scsBus.write(0xFF); scsBus.write(0xFF);
+    scsBus.write(id);   scsBus.write(len);
+    scsBus.write(ins);
+    for (int i = 0; i < n; i++) scsBus.write(p[i]);
+    scsBus.write(chk);
+    scsBus.flush(); // wait until packet is fully transmitted
+}
+
+// Write 16-bit goal position + time=0 + speed=0 to a servo.
+// SCSCL uses big-endian (high byte first).
+static void scsWritePos(uint8_t id, int pos) {
+    pos = constrain(pos, 0, 1000);
+    uint8_t p[] = {
+        REG_GOAL_POS,
+        (uint8_t)(pos >> 8),    // position high byte
+        (uint8_t)(pos & 0xFF),  // position low byte
+        0x00, 0x00,             // time = 0  → full speed
+        0x00, 0x00              // speed = 0 → full speed
+    };
+    scsSend(id, 0x03, p, 7);
+}
+
+static void scsTorque(uint8_t id, bool on) {
+    uint8_t p[] = {REG_TORQUE, on ? (uint8_t)1 : (uint8_t)0};
+    scsSend(id, 0x03, p, 2);
+}
+
+// degrees from center → SCS units  (1° = 3.2 units = 16/5)
+static int degToUnits(int deg) { return deg * 16 / 5; }
+
+static void moveServos(int pan, int tilt) {
+    int yaw   = constrain(CTR_YAW   + degToUnits(pan),
+                          CTR_YAW  - RANGE_YAW,  CTR_YAW  + RANGE_YAW);
+    int pitch = constrain(CTR_PITCH + degToUnits(tilt),
+                          CTR_PITCH - RANGE_PITCH, CTR_PITCH + RANGE_PITCH);
+    // SYNC_WRITE (0x83) to broadcast ID (0xFE): moves both servos in one packet.
+    // No individual responses → no half-duplex bus collision between commands.
+    uint8_t p[] = {
+        REG_GOAL_POS, 6,                                          // addr, data bytes per servo
+        ID_YAW,   (uint8_t)(yaw   >> 8), (uint8_t)(yaw   & 0xFF), 0,0, 0,0,
+        ID_PITCH, (uint8_t)(pitch >> 8), (uint8_t)(pitch & 0xFF), 0,0, 0,0
+    };
+    scsSend(0xFE, 0x83, p, sizeof(p));
+}
+
+static void centerServos() { moveServos(0, 0); }
+
+static void initServos() {
+    scsBus.begin(SCS_BAUD, SERIAL_8N1, SCS_RX, SCS_TX);
+    delay(100);
+    scsTorque(ID_YAW,   true);
+    scsTorque(ID_PITCH, true);
+    delay(50);
+    centerServos();
+}
 
 // ─── Alarm state ──────────────────────────────────────────────────────────
 static struct {
@@ -41,33 +111,6 @@ static struct {
     unsigned long lastScroll = 0;
     unsigned long lastMove   = 0;
 } alm;
-
-// ─── Servo helpers ────────────────────────────────────────────────────────
-
-static int clamp(int v, int lo, int hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
-static void moveServos(int pan, int tilt) {
-    int yaw   = clamp(CTR_YAW   + pan,  CTR_YAW   - RANGE_YAW,   CTR_YAW   + RANGE_YAW);
-    int pitch = clamp(CTR_PITCH + tilt, CTR_PITCH - RANGE_PITCH,  CTR_PITCH + RANGE_PITCH);
-    if (PIN_YAW   >= 0) servoYaw.write(yaw);
-    if (PIN_PITCH >= 0) servoPitch.write(pitch);
-}
-
-static void centerServos() { moveServos(0, 0); }
-
-static void initServos() {
-    if (PIN_YAW >= 0) {
-        servoYaw.setPeriodHertz(50);
-        servoYaw.attach(PIN_YAW, 500, 2400);
-    }
-    if (PIN_PITCH >= 0) {
-        servoPitch.setPeriodHertz(50);
-        servoPitch.attach(PIN_PITCH, 500, 2400);
-    }
-    centerServos();
-}
 
 // ─── Display helpers ──────────────────────────────────────────────────────
 
@@ -118,8 +161,6 @@ void setFace(const char* expr) {
 }
 
 // ─── Alarm implementation ─────────────────────────────────────────────────
-// All visual changes go through the Avatar API — direct display drawing
-// conflicts with the avatar's own FreeRTOS render task.
 
 static void setAvatarBg(bool red) {
     ColorPalette cp;
@@ -193,11 +234,7 @@ void startAlarm(const char* text, int durationSec, bool nervous) {
 void updateAlarm() {
     if (!alm.active) return;
     unsigned long now = millis();
-
-    if (now - alm.startMs >= alm.durMs) {
-        stopAlarm();
-        return;
-    }
+    if (now - alm.startMs >= alm.durMs) { stopAlarm(); return; }
     if (alm.audioBuf && !M5.Speaker.isPlaying()) {
         M5.Speaker.playWav(alm.audioBuf, alm.audioSz);
     }
@@ -253,28 +290,14 @@ void handleCommand(JsonDocument& doc) {
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "scan") == 0) {
-        // Probe candidate GPIO pins one by one with a brief sweep.
-        // Watch which pin makes your servo twitch to identify correct wiring.
-        // Each pin: 120ms move + 120ms return + 40ms gap = 280ms → 10 pins < 3s total.
-        static const int candidates[] = {1, 2, 7, 8, 9, 10, 17, 18, 38, 39};
-        static const int n = sizeof(candidates) / sizeof(candidates[0]);
-        JsonDocument resp;
-        resp["ok"] = true;
-        JsonArray tried = resp["pins"].to<JsonArray>();
-        for (int i = 0; i < n; i++) {
-            int pin = candidates[i];
-            tried.add(pin);
-            Servo probe;
-            probe.setPeriodHertz(50);
-            if (probe.attach(pin, 500, 2400) >= 0) {
-                probe.write(120); delay(120);
-                probe.write(90);  delay(120);
-                probe.detach();
-            }
-            delay(40);
-        }
-        serializeJson(resp, Serial);
-        Serial.println();
+        // Wiggle both servos to confirm SCS communication works
+        scsWritePos(ID_YAW,   CTR_YAW   + 150); // yaw  right ~47°
+        scsWritePos(ID_PITCH, CTR_PITCH +  75); // tilt up    ~23°
+        delay(700);
+        scsWritePos(ID_YAW,   CTR_YAW   - 150); // yaw  left
+        delay(700);
+        centerServos();
+        Serial.println("{\"ok\":true,\"info\":\"SCS wiggle done\"}");
 
     } else {
         Serial.printf("{\"ok\":false,\"err\":\"unknown cmd: %s\"}\n", cmd);
