@@ -1,5 +1,6 @@
 firmware/.pio/
 *.bin
+!backup/*.bin
 __pycache__/
 *.pyc
 .DS_Store
