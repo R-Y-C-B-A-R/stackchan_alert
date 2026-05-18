@@ -2,10 +2,10 @@
   "name": "look_around",
   "loop": false,
   "steps": [
-    {"pan":  40, "tilt":   0, "duration": 600},
-    {"pan": -40, "tilt":   0, "duration": 700},
-    {"pan":   0, "tilt":  30, "duration": 500},
-    {"pan":   0, "tilt": -12, "duration": 500},
-    {"pan":   0, "tilt":   0, "duration": 400}
+    {"pan":  40, "tilt":   0, "duration": 1500},
+    {"pan": -40, "tilt":   0, "duration": 1800},
+    {"pan":   0, "tilt":  30, "duration": 1200},
+    {"pan":   0, "tilt": -12, "duration": 1200},
+    {"pan":   0, "tilt":   0, "duration": 1000}
   ]
 }

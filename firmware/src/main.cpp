@@ -24,11 +24,11 @@ static const int     RANGE_PITCH  = 380;   // center 620 → 240..1000
 // degrees from center → SCS units
 static int degToUnits(int deg) { return deg * 38 / 9; }
 
-static void moveServos(int pan, int tilt) {
+static void moveServos(int pan, int tilt, int time_ms = 20) {
     int yaw   = constrain(CTR_YAW   + degToUnits(pan),   CTR_YAW   - RANGE_YAW,   CTR_YAW   + RANGE_YAW);
     int pitch = constrain(CTR_PITCH + degToUnits(tilt),  CTR_PITCH - RANGE_PITCH, CTR_PITCH + RANGE_PITCH);
-    scs.WritePos(ID_YAW,   yaw,   20, 0);
-    scs.WritePos(ID_PITCH, pitch, 20, 0);
+    scs.WritePos(ID_YAW,   yaw,   time_ms, 0);
+    scs.WritePos(ID_PITCH, pitch, time_ms, 0);
 }
 
 static void centerServos() { moveServos(0, 0); }
@@ -179,7 +179,7 @@ void startAlarm(const char* text, int durationSec, bool nervous) {
     alm.lastScroll = now;
     alm.lastMove   = now;
 
-    File f = LittleFS.open("/facilityalarm.wav", "r");
+    File f = LittleFS.open("/pingping.wav", "r");
     if (f) {
         alm.audioSz  = f.size();
         alm.audioBuf = (uint8_t*)ps_malloc(alm.audioSz);
@@ -248,7 +248,8 @@ void handleCommand(JsonDocument& doc) {
         if (!isServoHealthy()) {
             initServos();
         }
-        moveServos(doc["pan"] | 0, doc["tilt"] | 0);
+        int time_ms = doc["time"] | 20;
+        moveServos(doc["pan"] | 0, doc["tilt"] | 0, time_ms);
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "center") == 0) {

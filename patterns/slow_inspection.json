@@ -1,0 +1,13 @@
+{
+  "name": "slow_inspection",
+  "loop": false,
+  "steps": [
+    {"pan": 0, "tilt": 35, "duration": 2000, "face": "neutral"},
+    {"pan": -40, "tilt": 35, "duration": 2500},
+    {"pan": -40, "tilt": 0, "duration": 1800},
+    {"pan": 40, "tilt": 0, "duration": 3000},
+    {"pan": 0, "tilt": 0, "duration": 2000},
+    {"pan": 0, "tilt": 15, "duration": 1500},
+    {"pan": 0, "tilt": 0, "duration": 1800}
+  ]
+}

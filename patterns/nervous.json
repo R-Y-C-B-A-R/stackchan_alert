@@ -2,12 +2,12 @@
   "name": "nervous",
   "loop": true,
   "steps": [
-    {"pan":  15, "tilt":  8, "duration": 300},
-    {"pan": -15, "tilt": -6, "duration": 280},
-    {"pan":  10, "tilt":  10, "duration": 250},
-    {"pan": -12, "tilt": -4, "duration": 270},
-    {"pan":   8, "tilt":  6, "duration": 260},
-    {"pan":  -6, "tilt": -2, "duration": 240},
-    {"pan":   0, "tilt":  0, "duration": 350}
+    {"pan":  15, "tilt":  8, "duration": 700},
+    {"pan": -15, "tilt": -6, "duration": 650},
+    {"pan":  10, "tilt":  10, "duration": 600},
+    {"pan": -12, "tilt": -4, "duration": 650},
+    {"pan":   8, "tilt":  6, "duration": 600},
+    {"pan":  -6, "tilt": -2, "duration": 580},
+    {"pan":   0, "tilt":  0, "duration": 800}
   ]
 }

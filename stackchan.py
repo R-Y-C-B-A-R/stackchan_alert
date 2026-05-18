@@ -249,18 +249,26 @@ def run_pattern(path, port, loop_override=False, deadline=None):
                 if deadline and time.time() >= deadline:
                     return True
                 if "pan" in step or "tilt" in step:
+                    # Duration becomes the servo movement time (in ms)
+                    move_time = step.get("duration", 200)
                     # Don't do boot check for pattern execution (device already ready)
                     r = send({"cmd": "move",
                               "pan":  step.get("pan",  0),
-                              "tilt": step.get("tilt", 0)}, port=port, boot_check=False)
+                              "tilt": step.get("tilt", 0),
+                              "time": move_time}, port=port, boot_check=False)
                     if not r.get("ok"):
                         print(json.dumps(r))
                         sys.exit(1)
+                    # Wait slightly longer than the movement takes (servo interpolation)
+                    wait = (move_time + 50) / 1000.0
+                else:
+                    wait = step.get("duration", 200) / 1000.0
+
                 if "face" in step:
                     send({"cmd": "face", "expr": step["face"]}, port=port, boot_check=False)
                 if "text" in step:
                     send({"cmd": "print", "text": step["text"]}, port=port, boot_check=False)
-                wait = step.get("duration", 200) / 1000.0
+
                 if deadline:
                     wait = min(wait, max(0.0, deadline - time.time()))
                 time.sleep(wait)
