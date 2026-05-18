@@ -170,35 +170,48 @@ def resolve_port(port_arg):
     return port
 
 
-# ─── Serial communication ─────────────────────────────────────────────────
+# Global state: have we already reset in this session?
+_device_ready = False
 
-def send(cmd: dict, port: str, timeout: float = 5.0) -> dict:
+def send(cmd: dict, port: str, timeout: float = 5.0, boot_check: bool = False) -> dict:
+    """Send command to device.
+
+    Args:
+        cmd: Command dict to send
+        port: Serial port
+        timeout: Response timeout
+        boot_check: If True, check for boot banner and reset if not found
+    """
+    global _device_ready
+
     try:
         conn = StackChanConn(port, BAUD)
         try:
-            # Wait for boot banner; if device is already running, reset it so
-            # board_power_init() runs again and VM_EN is asserted.
-            deadline = time.time() + 3.0
-            boot_seen = False
-            while time.time() < deadline:
-                remaining = deadline - time.time()
-                obj = conn.read_json_object(timeout=min(0.5, remaining))
-                if obj is not None:
-                    if "ready" in obj or "boot" in obj:
-                        boot_seen = True
-                        break
-
-            if not boot_seen:
-                # Device already running – reset via RTS to re-init VM_EN
-                conn.hardware_reset()
-                deadline = time.time() + 6.0
+            # Only do reset check if explicitly requested or on first connection
+            if boot_check and not _device_ready:
+                deadline = time.time() + 3.0
+                boot_seen = False
                 while time.time() < deadline:
                     remaining = deadline - time.time()
-                    obj = conn.read_json_object(timeout=min(1.0, remaining))
+                    obj = conn.read_json_object(timeout=min(0.5, remaining))
                     if obj is not None:
                         if "ready" in obj or "boot" in obj:
                             boot_seen = True
+                            _device_ready = True
                             break
+
+                if not boot_seen:
+                    # Device already running – reset via RTS to re-init VM_EN
+                    conn.hardware_reset()
+                    deadline = time.time() + 6.0
+                    while time.time() < deadline:
+                        remaining = deadline - time.time()
+                        obj = conn.read_json_object(timeout=min(1.0, remaining))
+                        if obj is not None:
+                            if "ready" in obj or "boot" in obj:
+                                boot_seen = True
+                                _device_ready = True
+                                break
 
             # Send command
             conn.send(cmd)
@@ -236,16 +249,17 @@ def run_pattern(path, port, loop_override=False, deadline=None):
                 if deadline and time.time() >= deadline:
                     return True
                 if "pan" in step or "tilt" in step:
+                    # Don't do boot check for pattern execution (device already ready)
                     r = send({"cmd": "move",
                               "pan":  step.get("pan",  0),
-                              "tilt": step.get("tilt", 0)}, port=port)
+                              "tilt": step.get("tilt", 0)}, port=port, boot_check=False)
                     if not r.get("ok"):
                         print(json.dumps(r))
                         sys.exit(1)
                 if "face" in step:
-                    send({"cmd": "face", "expr": step["face"]}, port=port)
+                    send({"cmd": "face", "expr": step["face"]}, port=port, boot_check=False)
                 if "text" in step:
-                    send({"cmd": "print", "text": step["text"]}, port=port)
+                    send({"cmd": "print", "text": step["text"]}, port=port, boot_check=False)
                 wait = step.get("duration", 200) / 1000.0
                 if deadline:
                     wait = min(wait, max(0.0, deadline - time.time()))
@@ -418,17 +432,23 @@ movement pattern JSON format  (see patterns/ directory):
         payload["pan"]  = args.pan
         payload["tilt"] = args.tilt
 
-    result = send(payload, port=port, timeout=send_timeout)
+    # Special handling for alarm with motion: start pattern immediately without waiting
+    if args.cmd == "alarm" and getattr(args, "motion", None):
+        # Send alarm with boot check enabled
+        result = send(payload, port=port, timeout=send_timeout, boot_check=True)
+        if result.get("ok"):
+            # Start motion pattern while alarm is running (boot_check=False to avoid reset)
+            deadline = time.time() + args.duration
+            ok = run_pattern(args.motion, port=port, loop_override=True, deadline=deadline)
+            if not ok:
+                send({"cmd": "stopalarm"}, port=port, boot_check=False)
+            send({"cmd": "center"}, port=port, boot_check=False)
+    else:
+        # Regular command: enable boot check for first connection
+        boot_check = (args.cmd in ["alarm", "play", "scan"])  # Commands that might be first
+        result = send(payload, port=port, timeout=send_timeout, boot_check=boot_check)
+
     print(json.dumps(result))
-
-    # After alarm start, optionally drive head via motion pattern
-    if args.cmd == "alarm" and getattr(args, "motion", None) and result.get("ok"):
-        deadline = time.time() + args.duration
-        ok = run_pattern(args.motion, port=port, loop_override=True, deadline=deadline)
-        if not ok:
-            send({"cmd": "stopalarm"}, port=port)
-        send({"cmd": "center"}, port=port)
-
     sys.exit(0 if result.get("ok") else 1)
 
 
