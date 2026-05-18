@@ -2,147 +2,61 @@
 #include <Avatar.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include "driver/uart.h"
+#include "SCSCL.h"
 
 using namespace m5avatar;
 
 Avatar avatar;
+static SCSCL scs;  // Official StackChan servo library
 
 static const int STATUS_Y    = 200;
 static const int STATUS_H    = 40;
 static const int DISPLAY_W   = 320;
 static const int SPEECH_CHARS = 18;
 
-// ─── Feetech SCSCL serial servo ──────────────────────────────────────────
-// ESP-IDF UART1, TX=GPIO6, RX=GPIO7, 1 Mbps — matches official StackChan HAL exactly.
-// Using ESP-IDF directly (not Arduino HardwareSerial) avoids silent driver-install
-// conflicts that occur when M5Unified or the Arduino framework pre-claims UART1.
-#define SCS_UART   UART_NUM_1
-#define SCS_TX_PIN 6
-#define SCS_RX_PIN 7
-#define SCS_BAUD   1000000
-#define SCS_BUFSZ  256
-
 static const uint8_t ID_YAW       = 1;
 static const uint8_t ID_PITCH     = 2;
 static const int     CTR_YAW      = 460;   // neutral position in SCS units
 static const int     CTR_PITCH    = 620;
-static const int     RANGE_YAW    = 400;   // center 460 → 60..860 (within 0-1000)
-static const int     RANGE_PITCH  = 380;   // center 620 → 240..1000 (full upward range)
+static const int     RANGE_YAW    = 400;   // center 460 → 60..860
+static const int     RANGE_PITCH  = 380;   // center 620 → 240..1000
 
-// SCS register addresses (big-endian byte order for SCSCL series)
-static const uint8_t REG_TORQUE   = 0x28;  // Torque Enable
-static const uint8_t REG_GOAL_POS = 0x2A;  // Goal Position L (H is at 0x2B)
-
-// Send an SCS protocol packet:
-//   FF FF [id] [nparams+2] [ins] [params...] [chksum]
-static void scsSend(uint8_t id, uint8_t ins, const uint8_t* p, int n) {
-    uint8_t len = (uint8_t)(n + 2);
-    uint8_t chk = id + len + ins;
-    for (int i = 0; i < n; i++) chk += p[i];
-    chk = ~chk & 0xFF;
-
-    // Build full packet and send in one call (matches uart_write_bytes approach)
-    uint8_t pkt[5 + 32]; // header(5) + params(max 32)
-    pkt[0] = 0xFF; pkt[1] = 0xFF; pkt[2] = id; pkt[3] = len; pkt[4] = ins;
-    for (int i = 0; i < n; i++) pkt[5 + i] = p[i];
-    pkt[5 + n] = chk;
-    uart_write_bytes(SCS_UART, pkt, 6 + n);
-    uart_wait_tx_done(SCS_UART, pdMS_TO_TICKS(100));
-}
-
-// Read n data bytes from servo register. Returns bytes received (0 = timeout/no response).
-// Response bytes are left in buf (caller provides buf[n]).
-static int scsReadReg(uint8_t id, uint8_t reg, uint8_t* buf, int n) {
-    uart_flush_input(SCS_UART);
-    uint8_t chk = ~((uint8_t)(id + 4 + 0x02 + reg + (uint8_t)n)) & 0xFF;
-    uint8_t req[] = {0xFF, 0xFF, id, 4, 0x02, reg, (uint8_t)n, chk};
-    uart_write_bytes(SCS_UART, req, sizeof(req));
-    uart_wait_tx_done(SCS_UART, pdMS_TO_TICKS(100));
-    // Collect everything: echo (8 bytes) + response within 15 ms
-    delay(15);
-    uint8_t raw[32]; int got = 0;
-    got = uart_read_bytes(SCS_UART, raw, sizeof(raw), 0);
-    if (got < 0) got = 0;
-    // Search for response header: FF FF [id] [n+2] where 5th byte != 0x02 (not our echo INS)
-    for (int i = 0; i + n + 4 <= got; i++) {
-        if (raw[i] == 0xFF && raw[i+1] == 0xFF && raw[i+2] == id &&
-            raw[i+3] == (uint8_t)(n + 2) && raw[i+4] != 0x02) {
-            for (int j = 0; j < n; j++) buf[j] = raw[i + 5 + j];
-            return got;
-        }
-    }
-    return got;
-}
-
-static int scsReadPos(uint8_t id) {
-    uint8_t buf[2] = {0, 0};
-    int got = scsReadReg(id, 0x38, buf, 2); // Present Position L register
-    if (got == 0) return -2; // nothing received at all (RX not on bus or UART dead)
-    if (got < 14) return -1; // only echo, no servo response
-    return (buf[0] << 8) | buf[1];
-}
-
-// Write 16-bit goal position. time=20 matches official firmware (0 caused no movement).
-// SCSCL uses big-endian (high byte first).
-static void scsWritePos(uint8_t id, int pos) {
-    pos = constrain(pos, 0, 1000);
-    uint8_t p[] = {
-        REG_GOAL_POS,
-        (uint8_t)(pos >> 8),    // position high byte
-        (uint8_t)(pos & 0xFF),  // position low byte
-        0x00, 20,               // time = 20 (matches official StackChan firmware)
-        0x00, 0x00              // speed = 0 → default
-    };
-    scsSend(id, 0x03, p, 7);
-}
-
-static void scsTorque(uint8_t id, bool on) {
-    uint8_t p[] = {REG_TORQUE, on ? (uint8_t)1 : (uint8_t)0};
-    scsSend(id, 0x03, p, 2);
-}
-
-// degrees from center → SCS units  (1° = 3.2 units = 16/5)
+// degrees from center → SCS units
 static int degToUnits(int deg) { return deg * 38 / 9; }
 
 static void moveServos(int pan, int tilt) {
-    int yaw   = constrain(CTR_YAW   + degToUnits(pan),
-                          CTR_YAW  - RANGE_YAW,  CTR_YAW  + RANGE_YAW);
-    int pitch = constrain(CTR_PITCH + degToUnits(tilt),
-                          CTR_PITCH - RANGE_PITCH, CTR_PITCH + RANGE_PITCH);
-    // SYNC_WRITE (0x83) to broadcast ID (0xFE): moves both servos in one packet.
-    // No individual responses → no half-duplex bus collision between commands.
-    uint8_t p[] = {
-        REG_GOAL_POS, 6,                                              // addr, data bytes per servo
-        ID_YAW,   (uint8_t)(yaw   >> 8), (uint8_t)(yaw   & 0xFF), 0, 20, 0, 0,
-        ID_PITCH, (uint8_t)(pitch >> 8), (uint8_t)(pitch & 0xFF), 0, 20, 0, 0
-    };
-    scsSend(0xFE, 0x83, p, sizeof(p));
+    int yaw   = constrain(CTR_YAW   + degToUnits(pan),   CTR_YAW   - RANGE_YAW,   CTR_YAW   + RANGE_YAW);
+    int pitch = constrain(CTR_PITCH + degToUnits(tilt),  CTR_PITCH - RANGE_PITCH, CTR_PITCH + RANGE_PITCH);
+    scs.WritePos(ID_YAW,   yaw,   20, 0);
+    scs.WritePos(ID_PITCH, pitch, 20, 0);
 }
 
 static void centerServos() { moveServos(0, 0); }
 
 static void initServos() {
-    // Use ESP-IDF UART directly — same approach as the official StackChan HAL.
-    // Delete first in case the Arduino framework or M5Unified already installed a driver.
-    uart_driver_delete(SCS_UART);
-    uart_config_t cfg = {};
-    cfg.baud_rate  = SCS_BAUD;
-    cfg.data_bits  = UART_DATA_8_BITS;
-    cfg.parity     = UART_PARITY_DISABLE;
-    cfg.stop_bits  = UART_STOP_BITS_1;
-    cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
-    uart_driver_install(SCS_UART, SCS_BUFSZ, SCS_BUFSZ, 0, NULL, 0);
-    uart_param_config(SCS_UART, &cfg);
-    uart_set_pin(SCS_UART, SCS_TX_PIN, SCS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    delay(100);
-    scsTorque(ID_YAW,   false); // toggle off first to clear any overload protection state
-    scsTorque(ID_PITCH, false);
-    delay(100);
-    scsTorque(ID_YAW,   true);
-    scsTorque(ID_PITCH, true);
-    delay(50);
+    scs.begin(UART_NUM_1, 1000000, 6, 7);  // Same params as original StackChan
+    delay(500);  // Longer wait for servo boot
+    scs.EnableTorque(ID_YAW,   0);
+    scs.EnableTorque(ID_PITCH, 0);
+    delay(200);
+    scs.EnableTorque(ID_YAW,   1);
+    scs.EnableTorque(ID_PITCH, 1);
+    delay(200);
     centerServos();
+    delay(100);
+}
+
+static bool isServoHealthy() {
+    return scs.ReadPos(ID_YAW) >= 0 && scs.ReadPos(ID_PITCH) >= 0;
+}
+
+static void diagServos() {
+    bool init_ok = scs.begin(UART_NUM_1, 1000000, 6, 7);
+    delay(100);
+    int yaw_pos   = scs.ReadPos(ID_YAW);
+    int pitch_pos = scs.ReadPos(ID_PITCH);
+    Serial.printf("{\"ok\":true,\"diag\":{\"init\":%d,\"yaw\":%d,\"pitch\":%d}}\n",
+                  init_ok ? 1 : 0, yaw_pos, pitch_pos);
 }
 
 // ─── Alarm state ──────────────────────────────────────────────────────────
@@ -331,27 +245,42 @@ void handleCommand(JsonDocument& doc) {
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "move") == 0) {
+        if (!isServoHealthy()) {
+            initServos();
+        }
         moveServos(doc["pan"] | 0, doc["tilt"] | 0);
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "center") == 0) {
+        if (!isServoHealthy()) {
+            initServos();
+        }
         centerServos();
         Serial.println("{\"ok\":true}");
 
     } else if (strcmp(cmd, "ping") == 0) {
-        int yaw_pos   = scsReadPos(ID_YAW);
-        int pitch_pos = scsReadPos(ID_PITCH);
+        if (!isServoHealthy()) {
+            initServos(); // Re-init if UART is dead (USB reconnect scenario)
+        }
+        int yaw_pos   = scs.ReadPos(ID_YAW);
+        int pitch_pos = scs.ReadPos(ID_PITCH);
         Serial.printf("{\"ok\":true,\"yaw\":%d,\"pitch\":%d}\n", yaw_pos, pitch_pos);
 
     } else if (strcmp(cmd, "scan") == 0) {
+        if (!isServoHealthy()) {
+            initServos(); // Re-init if UART is dead
+        }
         // Wiggle both servos to confirm SCS communication works
-        scsWritePos(ID_YAW,   CTR_YAW   + 150); // yaw  right ~47°
-        scsWritePos(ID_PITCH, CTR_PITCH +  75); // tilt up    ~23°
+        scs.WritePos(ID_YAW,   CTR_YAW   + 150, 20, 0); // yaw  right ~47°
+        scs.WritePos(ID_PITCH, CTR_PITCH +  75, 20, 0); // tilt up    ~23°
         delay(700);
-        scsWritePos(ID_YAW,   CTR_YAW   - 150); // yaw  left
+        scs.WritePos(ID_YAW,   CTR_YAW   - 150, 20, 0); // yaw  left
         delay(700);
         centerServos();
         Serial.println("{\"ok\":true,\"info\":\"SCS wiggle done\"}");
+
+    } else if (strcmp(cmd, "diag") == 0) {
+        diagServos();
 
     } else {
         Serial.printf("{\"ok\":false,\"err\":\"unknown cmd: %s\"}\n", cmd);
@@ -373,11 +302,15 @@ void setup() {
         M5.Display.println("LittleFS error");
     }
 
-    initServos();
     avatar.init();
     M5.Display.drawFastHLine(0, STATUS_Y, DISPLAY_W, TFT_DARKGREY);
 
     Serial.begin(115200);
+
+    // Init servos AFTER M5.begin() and Serial.begin() so we can see errors
+    // uart_driver_delete() in scs.begin() will override any M5Unified UART
+    initServos();
+
     Serial.println("{\"ready\":true}");
 }
 

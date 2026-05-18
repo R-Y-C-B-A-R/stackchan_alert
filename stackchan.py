@@ -12,6 +12,91 @@ import argparse
 BAUD = 115200
 
 
+# ─── Serial connection with hardware reset ──────────────────────────────────
+
+class StackChanConn:
+    """Serial connection with RTS-based hardware reset support."""
+
+    def __init__(self, port: str, baud: int = 115200):
+        self.ser = serial.Serial(port, baud, timeout=0.1)
+        time.sleep(0.1)
+        self.ser.reset_input_buffer()
+
+    def hardware_reset(self):
+        """Reset ESP32 via RTS (same as esptool). Triggers board_power_init → VM_EN."""
+        self.ser.dtr = False
+        self.ser.rts = True   # EN pin low → chip in reset
+        time.sleep(0.1)
+        self.ser.rts = False  # EN pin high → normal boot
+        self.ser.dtr = False
+        time.sleep(0.05)
+        self.ser.reset_input_buffer()
+
+    def read_json_object(self, timeout: float = 1.0):
+        """Read bytes until a balanced { } JSON object is assembled.
+
+        Ignores everything before the first '{' so IDF log lines and echo
+        bytes are skipped automatically.
+        """
+        deadline = time.time() + timeout
+        buf = ''
+        depth = 0
+        in_str = False
+        esc = False
+
+        while time.time() < deadline:
+            b = self.ser.read(1)
+            if not b:
+                continue
+            ch = b.decode(errors='replace')
+
+            if not buf and ch != '{':
+                continue  # skip until opening brace
+
+            buf += ch
+
+            if esc:
+                esc = False
+                continue
+            if ch == '\\' and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(buf)
+                    except json.JSONDecodeError:
+                        buf = ''  # garbled object – reset and try again
+        return None
+
+    def send(self, cmd: dict):
+        """Send a JSON command."""
+        self.ser.write(json.dumps(cmd).encode() + b"\n")
+        self.ser.flush()
+
+    def read_response(self, timeout: float = 5.0):
+        """Read JSON response (skips non-JSON lines)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            obj = self.read_json_object(timeout=min(1.0, remaining))
+            if obj is not None:
+                return obj
+        return None
+
+    def close(self):
+        self.ser.close()
+
+
 # ─── Port detection (Linux) ───────────────────────────────────────────────
 
 def check_dialout():
@@ -89,19 +174,39 @@ def resolve_port(port_arg):
 
 def send(cmd: dict, port: str, timeout: float = 5.0) -> dict:
     try:
-        with serial.Serial(port, BAUD, timeout=1.0) as s:
-            s.write(json.dumps(cmd).encode() + b"\n")
-            deadline = time.time() + timeout
+        conn = StackChanConn(port, BAUD)
+        try:
+            # Wait for boot banner; if device is already running, reset it so
+            # board_power_init() runs again and VM_EN is asserted.
+            deadline = time.time() + 3.0
+            boot_seen = False
             while time.time() < deadline:
-                line = s.readline().decode(errors="replace").strip()
-                if not line:
-                    continue
-                if line.startswith("{"):
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError:
-                        return {"ok": False, "err": f"bad json: {line}"}
-            return {"ok": False, "err": "timeout"}
+                remaining = deadline - time.time()
+                obj = conn.read_json_object(timeout=min(0.5, remaining))
+                if obj is not None:
+                    if "ready" in obj or "boot" in obj:
+                        boot_seen = True
+                        break
+
+            if not boot_seen:
+                # Device already running – reset via RTS to re-init VM_EN
+                conn.hardware_reset()
+                deadline = time.time() + 6.0
+                while time.time() < deadline:
+                    remaining = deadline - time.time()
+                    obj = conn.read_json_object(timeout=min(1.0, remaining))
+                    if obj is not None:
+                        if "ready" in obj or "boot" in obj:
+                            boot_seen = True
+                            break
+
+            # Send command
+            conn.send(cmd)
+            result = conn.read_response(timeout=timeout)
+            return result if result else {"ok": False, "err": "timeout"}
+
+        finally:
+            conn.close()
     except serial.SerialException as e:
         if "Permission denied" in str(e):
             check_dialout()
@@ -257,6 +362,9 @@ movement pattern JSON format  (see patterns/ directory):
 
     # ── ping ──────────────────────────────────────────────────────────────
     sub.add_parser("ping", help="Read servo positions (diagnostic: -2=no RX, -1=no response)")
+
+    # ── diag ──────────────────────────────────────────────────────────────
+    sub.add_parser("diag", help="Run UART diagnostics on servo interface")
 
     # ─────────────────────────────────────────────────────────────────────
     args = p.parse_args()

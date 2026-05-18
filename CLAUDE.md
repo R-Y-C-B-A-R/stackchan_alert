@@ -197,6 +197,15 @@ Aktuelle Patterns und ihre Winkel (neu kalibriert mit 38/9 Faktor):
 
 ## Bekannte Stolperstellen
 
+### Servo-Offline nach Reconnect (GELÖST)
+Symptom: Servos funktionieren in der Entwicklung, dann gehen sie offline und reagieren nicht mehr.
+Root Cause: Wenn der Host/PC neu gestartet wird ohne das Gerät zu resetten, bleibt die Firmware
+in einem alten Zustand. VM_EN (Servo-Stromversorgung im PY32 IO-Expander) wird nicht neu
+asserted, daher keine Servo-Kommunikation möglich.
+→ **Fix**: `stackchan.py` führt jetzt `hardware_reset()` via RTS durch, wenn beim Connect
+kein Boot-Banner empfangen wird. Dies triggert `setup()` neu, was `initServos()` und damit
+die Servo-Initialisierung erneut ausführt. Siehe `StackChanConn` Klasse in `stackchan.py`.
+
 ### LittleFS-Partition-Label (GELÖST)
 `LittleFS.begin()` sucht standardmäßig nach Partition mit Name `"spiffs"`.
 Unsere Partition heißt `"littlefs"` (laut partitions.csv).
