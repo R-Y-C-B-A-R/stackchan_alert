@@ -197,14 +197,21 @@ Aktuelle Patterns und ihre Winkel (neu kalibriert mit 38/9 Faktor):
 
 ## Bekannte Stolperstellen
 
-### Servo-Offline nach Reconnect (GELÖST)
-Symptom: Servos funktionieren in der Entwicklung, dann gehen sie offline und reagieren nicht mehr.
-Root Cause: Wenn der Host/PC neu gestartet wird ohne das Gerät zu resetten, bleibt die Firmware
-in einem alten Zustand. VM_EN (Servo-Stromversorgung im PY32 IO-Expander) wird nicht neu
-asserted, daher keine Servo-Kommunikation möglich.
-→ **Fix**: `stackchan.py` führt jetzt `hardware_reset()` via RTS durch, wenn beim Connect
-kein Boot-Banner empfangen wird. Dies triggert `setup()` neu, was `initServos()` und damit
-die Servo-Initialisierung erneut ausführt. Siehe `StackChanConn` Klasse in `stackchan.py`.
+### Servo-Offline nach Reconnect (GELÖST — vollständige Lösung)
+Symptom: Servos funktionieren in der Entwicklung, dann gehen sie offline und reagieren nicht mehr,
+besonders nach USB-Reconnect an einem anderen Rechner oder nach längerem Nichtbenutzen.
+
+Root Cause (tief): Der PY32 IO-Expander (0x6F) ist ein eigenständiger Mikrocontroller, der nach
+einem USB-Reconnect langsamer bootet als der ESP32-S3. Alte Blind-Writes an VM_EN (PY32 Pin 0)
+während des PY32-Boots werden silently verworfen → Servos bekommen keine Versorgungsspannung.
+
+**Fix in `board_power_init()` (übernommen aus `stackchan_servo`-Repo):**
+1. `py32_wait_ready()`: Pollt das PY32-Versionsregister (0x02) mit Timeout 3 s, bevor VM_EN gesetzt wird
+2. `servo_power_set()`: Read-Modify-Write statt Blind-Write für alle drei PY32-Register (Dir/PU/Out)
+3. Readback-Verifikation: nach Schreiben wird der Ist-Zustand gelesen und bei Abweichung bis zu 3× retry
+
+**Zusätzliche Absicherung auf Python-Seite**: `stackchan.py` führt `hardware_reset()` via RTS durch,
+wenn beim Connect kein Boot-Banner empfangen wird — triggert `setup()` neu. Siehe `StackChanConn`.
 
 ### LittleFS-Partition-Label (GELÖST)
 `LittleFS.begin()` sucht standardmäßig nach Partition mit Name `"spiffs"`.

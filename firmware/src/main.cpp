@@ -288,6 +288,113 @@ void handleCommand(JsonDocument& doc) {
     }
 }
 
+// ─── Power initialization (servo VM_EN + LDOs) ────────────────────────────
+
+// PY32 IO-Expander register map
+#define PY32_ADDR        0x6F
+#define PY32_REG_VERSION 0x02
+#define PY32_REG_DIR_L   0x03  // direction (1=output)
+#define PY32_REG_OUT_L   0x05  // output value
+#define PY32_REG_PU_L    0x09  // pull-up enable
+#define PY32_REG_PD_L    0x0B  // pull-down enable
+// Pin 0 of PY32 = VM_EN (servo motor power rail)
+
+static void i2c_write_safe(uint8_t addr, uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(val);
+    uint8_t err = Wire.endTransmission(true);
+    if (err != 0) Serial.printf("{\"warn\":\"i2c write failed addr=0x%02X reg=0x%02X err=%d\"}\n", addr, reg, err);
+}
+
+static bool i2c_read_safe(uint8_t addr, uint8_t reg, uint8_t* val) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(addr, (uint8_t)1) != 1) return false;
+    *val = Wire.read();
+    return true;
+}
+
+// Read-modify-write: set or clear `mask` bits in `reg` at `addr`
+static bool i2c_update_bits(uint8_t addr, uint8_t reg, uint8_t mask, bool set) {
+    uint8_t v = 0;
+    if (!i2c_read_safe(addr, reg, &v)) return false;
+    v = set ? (v | mask) : (v & ~mask);
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(v);
+    return Wire.endTransmission(true) == 0;
+}
+
+// Poll PY32 version register until it responds with a valid value (not 0x00/0xFF).
+// The PY32 is a separate MCU that boots slower than the ESP32-S3 after USB reconnect;
+// without this wait, blind writes to VM_EN are silently lost → servos stay unpowered.
+static bool py32_wait_ready(uint32_t timeout_ms = 3000) {
+    uint32_t t0 = millis();
+    int tries = 0;
+    while (millis() - t0 < timeout_ms) {
+        uint8_t ver = 0;
+        if (i2c_read_safe(PY32_ADDR, PY32_REG_VERSION, &ver) && ver != 0x00 && ver != 0xFF) {
+            Serial.printf("{\"info\":\"PY32 ready ver=0x%02X tries=%d\"}\n", ver, tries + 1);
+            return true;
+        }
+        tries++;
+        delay(100);
+    }
+    Serial.printf("{\"warn\":\"PY32 not ready after %d ms\"}\n", timeout_ms);
+    return false;
+}
+
+// Assert VM_EN (PY32 pin 0) with read-modify-write and verified readback. Retries 3×.
+static bool servo_power_set(bool on) {
+    if (!py32_wait_ready()) return false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        bool ok = i2c_update_bits(PY32_ADDR, PY32_REG_DIR_L, 0x01, true)   // output
+               && i2c_update_bits(PY32_ADDR, PY32_REG_PD_L,  0x01, false)  // no pull-down
+               && i2c_update_bits(PY32_ADDR, PY32_REG_PU_L,  0x01, true)   // pull-up
+               && i2c_update_bits(PY32_ADDR, PY32_REG_OUT_L,  0x01, on);   // drive high/low
+        if (ok) {
+            // Verify by reading back both direction and output registers
+            uint8_t m = 0, o = 0;
+            if (i2c_read_safe(PY32_ADDR, PY32_REG_DIR_L, &m) &&
+                i2c_read_safe(PY32_ADDR, PY32_REG_OUT_L, &o) &&
+                (m & 0x01) && (bool)(o & 0x01) == on) {
+                Serial.printf("{\"info\":\"VM_EN %s verified\"}\n", on ? "HIGH" : "LOW");
+                return true;
+            }
+        }
+        Serial.printf("{\"warn\":\"VM_EN write/verify failed attempt=%d\"}\n", attempt);
+        delay(100);
+    }
+    return false;
+}
+
+static void board_power_init() {
+    Serial.println("{\"info\":\"board_power_init start\"}");
+
+    Wire.begin(12, 11, 400000);
+    delay(100);
+
+    // AXP2101 PMIC: enable LDO rails at 3.3 V
+    i2c_write_safe(0x34, 0x90, 0xBF);
+    i2c_write_safe(0x34, 0x94, 28);
+    i2c_write_safe(0x34, 0x95, 28);
+    i2c_write_safe(0x34, 0x97, 28);
+
+    // AW9523 IO expander: display/audio GPIOs
+    uint8_t aw9523_regs[][2] = {{0x02, 0b00000111}, {0x03, 0b10001111}, {0x04, 0b00011000}, {0x05, 0b00001100}, {0x11, 0b00010000}, {0x12, 0b11111111}, {0x13, 0b11111111}};
+    for (auto& reg : aw9523_regs) {
+        i2c_write_safe(0x58, reg[0], reg[1]);
+    }
+
+    // PY32 IO expander: assert VM_EN (servo motor power rail) with polling + verified readback
+    bool vm_en_ok = servo_power_set(true);
+    Serial.printf("{\"info\":\"board_power_init done vm_en=%s\"}\n", vm_en_ok ? "true" : "false");
+
+    delay(200);  // wait for power rails to stabilise
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────
 
 void setup() {
@@ -307,6 +414,8 @@ void setup() {
     M5.Display.drawFastHLine(0, STATUS_Y, DISPLAY_W, TFT_DARKGREY);
 
     Serial.begin(115200);
+
+    board_power_init();
 
     // Init servos AFTER M5.begin() and Serial.begin() so we can see errors
     // uart_driver_delete() in scs.begin() will override any M5Unified UART
